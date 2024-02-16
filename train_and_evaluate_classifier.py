@@ -4,7 +4,7 @@ import random
 from typing import Dict
 import warnings
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import torch
@@ -114,12 +114,20 @@ def main():
             if not os.path.isdir(basedir):
                 raise ValueError(f'The directory "{basedir}" does not exist!')
 
-    dataset = load_dataset(args.dataset_name, args.task_name, split='train', num_proc=n_processes)
+    if os.path.isdir(args.dataset_name):
+        dataset = load_dataset(os.path.join(str(args.dataset_name), str(args.task_name)), split='train',
+                               num_proc=n_processes)
+    else:
+        dataset = load_dataset(args.dataset_name, args.task_name, split='train', num_proc=n_processes)
     train_test_split = dataset.train_test_split(shuffle=True, test_size=0.1, seed=args.random_seed)
     training_set = train_test_split['train']
     validation_set = train_test_split['test']
     del dataset, train_test_split
-    test_set = load_dataset(args.dataset_name, args.task_name, split='validation', num_proc=n_processes)
+    if os.path.isdir(args.dataset_name):
+        test_set = load_dataset(os.path.join(str(args.dataset_name), str(args.task_name)), split='validation',
+                                num_proc=n_processes)
+    else:
+        test_set = load_dataset(args.dataset_name, args.task_name, split='validation', num_proc=n_processes)
     print(f'The dataset {os.path.basename(args.dataset_name)}[{args.task_name}] is loaded.')
     print(f'Number of training samples is {len(training_set)}.')
     print(f'Number of validation samples is {len(validation_set)}.')
