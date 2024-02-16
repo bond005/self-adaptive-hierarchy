@@ -8,11 +8,11 @@ import torch
 from torch.nn.modules.loss import _Loss
 from transformers import DistilBertPreTrainedModel, DistilBertModel, DistilBertConfig
 from transformers import AutoModelForSequenceClassification, AutoConfig
-from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_outputs import BaseModelOutput
 
 
 @dataclass
-class HierarchicalSequenceEmbedderOutput(ModelOutput):
+class HierarchicalSequenceEmbedderOutput(BaseModelOutput):
     loss: Optional[torch.FloatTensor] = None
     embeddings: torch.FloatTensor = None
     layer_embeddings: torch.FloatTensor = None
@@ -21,7 +21,7 @@ class HierarchicalSequenceEmbedderOutput(ModelOutput):
 
 
 @dataclass
-class HierarchicalSequenceClassifierOutput(ModelOutput):
+class HierarchicalSequenceClassifierOutput(BaseModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     embeddings: torch.FloatTensor = None
@@ -36,25 +36,6 @@ class HierarchicalDistilBertConfig(DistilBertConfig):
     def __init__(self, label_smoothing: Optional[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.label_smoothing = label_smoothing
-
-
-class DistilBertHierarchicalClassificationHead(torch.nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = torch.nn.Linear(config.hidden_size, config.hidden_size)
-        classifier_dropout = (
-            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
-        )
-        self.dropout = torch.nn.Dropout(classifier_dropout)
-        self.out_proj = torch.nn.Linear(config.hidden_size, config.num_labels)
-
-    def forward(self, features, **kwargs):
-        x = self.dropout(features)
-        x = self.dense(x)
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        x = self.out_proj(x)
-        return x
 
 
 class DistanceBasedLogisticLoss(_Loss):
@@ -115,13 +96,12 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
     def __init__(self, config: HierarchicalDistilBertConfig):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.temperature = config.temperature
         self.config = config
 
-        self.bert = DistilBertModel(config, add_pooling_layer=False)
+        self.distilbert = DistilBertModel(config)
         self.layer_weights = LayerGatingNetwork(in_features=config.num_hidden_layers)
 
-        self.init_weights()
+        self.post_init()
 
     def init_weights(self):
         super().init_weights()
@@ -134,8 +114,6 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             attention_mask: Optional[torch.FloatTensor] = None,
             input_ids_2: Optional[torch.LongTensor] = None,
             attention_mask_2: Optional[torch.LongTensor] = None,
-            token_type_ids: Optional[torch.LongTensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
             head_mask: Optional[torch.FloatTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
@@ -144,11 +122,9 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
     ) -> Union[Tuple, HierarchicalSequenceEmbedderOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.bert(
+        outputs = self.distilbert(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -156,7 +132,7 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             return_dict=False
         )
         cls_hidden_states = torch.stack(
-            tensors=outputs[2][-self.config.num_hidden_layers:],
+            tensors=outputs[1][-self.config.num_hidden_layers:],
             dim=1
         )[:, :, 0, :]
         cls_emb = self.layer_weights(cls_hidden_states.permute(0, 2, 1))[:, :, 0]
@@ -168,7 +144,7 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             if (input_ids_2 is None) or (attention_mask_2 is None):
                 err_msg = 'The second texts (their input IDs and attention masks) in the pairs are not specified!'
                 raise ValueError(err_msg)
-            outputs_2 = self.bert(
+            outputs_2 = self.distilbert(
                 input_ids_2,
                 attention_mask=attention_mask_2,
                 output_hidden_states=True,
@@ -186,15 +162,15 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             loss = loss_fct(distances, labels.view(-1))
 
         if not return_dict:
-            output = (cls_emb, cls_hidden_states) + outputs[2:]
+            output = (cls_emb, cls_hidden_states) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return HierarchicalSequenceEmbedderOutput(
             loss=loss,
             embeddings=cls_emb,
             layer_embeddings=cls_hidden_states,
-            hidden_states=outputs[2],
-            attentions=outputs[3] if output_attentions else None,
+            hidden_states=outputs[1],
+            attentions=outputs[2] if output_attentions else None,
         )
 
     @property
@@ -215,9 +191,11 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
         self.label_smoothing = config.label_smoothing
         self.config = config
 
-        self.classifier = DistilBertHierarchicalClassificationHead(config)
+        self.pre_classifier = torch.nn.Linear(config.dim, config.dim)
+        self.classifier = torch.nn.Linear(config.dim, config.num_labels)
+        self.dropout = torch.nn.Dropout(config.seq_classif_dropout)
 
-        self.init_weights()
+        self.post_init()
 
     def forward(
             self,
@@ -225,8 +203,6 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
             attention_mask: Optional[torch.FloatTensor] = None,
             right_input_ids: Optional[torch.LongTensor] = None,
             right_attention_mask: Optional[torch.LongTensor] = None,
-            token_type_ids: Optional[torch.LongTensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
             head_mask: Optional[torch.FloatTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
@@ -238,15 +214,18 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
         outputs = super().forward(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             return_dict=return_dict,
         )
-        sequence_output = outputs[0]
-        logits = self.classifier(sequence_output)
+        if return_dict:
+            pooled_output = self.pre_classifier(outputs.embeddings)
+        else:
+            pooled_output = self.pre_classifier(outputs[0])
+        pooled_output = torch.nn.ReLU()(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
 
         loss = None
         if labels is not None:
