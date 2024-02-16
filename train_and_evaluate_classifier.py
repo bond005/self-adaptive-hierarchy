@@ -4,7 +4,7 @@ import random
 from typing import Dict
 import warnings
 
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import torch
@@ -60,7 +60,10 @@ def sst2_to_array_fn(batch):
 def compute_metrics(eval_pred):
     probabilities, labels = eval_pred
     y_true = labels.flatten().astype(np.int32)
-    y_pred = np.argmax(probabilities, axis=-1).flatten().astype(np.int32)
+    if isinstance(probabilities, np.ndarray):
+        y_pred = np.argmax(probabilities, axis=-1).flatten().astype(np.int32)
+    else:
+        y_pred = np.argmax(probabilities[0], axis=-1).flatten().astype(np.int32)
     res = {
         'f1': f1_score(y_true=y_true, y_pred=y_pred, average='binary' if (number_of_classes < 3) else 'macro'),
         'accuracy': accuracy_score(y_true=y_true, y_pred=y_pred)
@@ -250,7 +253,11 @@ def main():
         print('  - {0:<{1}} = {2:.6f}'.format(metric_name, metric_name_width, metrics[metric_name]))
     print('')
     target_names = [id2label[label_id] for label_id in sorted(list(id2label.keys()))]
-    print(classification_report(y_true=label_ids, y_pred=predictions, target_names=target_names, digits=4))
+    if isinstance(predictions, np.ndarray):
+        y_pred = np.argmax(predictions, axis=-1)
+    else:
+        y_pred = np.argmax(predictions[0], axis=-1)
+    print(classification_report(y_true=label_ids, y_pred=y_pred, target_names=target_names, digits=4))
 
 
 if __name__ == '__main__':

@@ -8,26 +8,7 @@ import torch
 from torch.nn.modules.loss import _Loss
 from transformers import DistilBertPreTrainedModel, DistilBertModel, DistilBertConfig
 from transformers import AutoModelForSequenceClassification, AutoConfig
-from transformers.modeling_outputs import BaseModelOutput
-
-
-@dataclass
-class HierarchicalSequenceEmbedderOutput(BaseModelOutput):
-    loss: Optional[torch.FloatTensor] = None
-    embeddings: torch.FloatTensor = None
-    layer_embeddings: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-
-
-@dataclass
-class HierarchicalSequenceClassifierOutput(BaseModelOutput):
-    loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    embeddings: torch.FloatTensor = None
-    layer_embeddings: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 
 class HierarchicalDistilBertConfig(DistilBertConfig):
@@ -119,7 +100,7 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             labels: Optional[torch.LongTensor] = None,
             output_attentions: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, HierarchicalSequenceEmbedderOutput]:
+    ) -> Union[Tuple, SequenceClassifierOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.distilbert(
@@ -162,13 +143,12 @@ class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
             loss = loss_fct(distances, labels.view(-1))
 
         if not return_dict:
-            output = (cls_emb, cls_hidden_states) + outputs[1:]
+            output = (cls_emb,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return HierarchicalSequenceEmbedderOutput(
+        return SequenceClassifierOutput(
             loss=loss,
-            embeddings=cls_emb,
-            layer_embeddings=cls_hidden_states,
+            logits=cls_emb,
             hidden_states=outputs[1],
             attentions=outputs[2] if output_attentions else None,
         )
@@ -208,7 +188,7 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
             labels: Optional[torch.LongTensor] = None,
             output_attentions: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, HierarchicalSequenceClassifierOutput]:
+    ) -> Union[Tuple, SequenceClassifierOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = super().forward(
@@ -220,7 +200,7 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
             return_dict=return_dict,
         )
         if return_dict:
-            pooled_output = self.pre_classifier(outputs.embeddings)
+            pooled_output = self.pre_classifier(outputs.logits)
         else:
             pooled_output = self.pre_classifier(outputs[0])
         pooled_output = torch.nn.ReLU()(pooled_output)
@@ -254,14 +234,12 @@ class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalE
                 loss = loss_fct(logits, labels)
 
         if not return_dict:
-            output = (logits,) + outputs
+            output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return HierarchicalSequenceClassifierOutput(
+        return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
-            embeddings=outputs.embeddings,
-            layer_embeddings=outputs.layer_embeddings,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions
         )
