@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 from torch.nn.modules.loss import _Loss
-from transformers import BertPreTrainedModel, BertModel, BertConfig
+from transformers import DistilBertPreTrainedModel, DistilBertModel, DistilBertConfig
 from transformers import AutoModelForSequenceClassification, AutoConfig
 from transformers.modeling_outputs import ModelOutput
 
@@ -30,15 +30,15 @@ class HierarchicalSequenceClassifierOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
-class HierarchicalBertConfig(BertConfig):
-    model_type = "hierarchical-bert"
+class HierarchicalDistilBertConfig(DistilBertConfig):
+    model_type = "hierarchical-distilbert"
 
     def __init__(self, label_smoothing: Optional[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.label_smoothing = label_smoothing
 
 
-class BertHierarchicalClassificationHead(torch.nn.Module):
+class DistilBertHierarchicalClassificationHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = torch.nn.Linear(config.hidden_size, config.hidden_size)
@@ -109,16 +109,16 @@ class LayerGatingNetwork(torch.nn.Module):
         return 'in_features={}'.format(self.in_features)
 
 
-class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
-    config_class = HierarchicalBertConfig
+class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
+    config_class = HierarchicalDistilBertConfig
 
-    def __init__(self, config: HierarchicalBertConfig):
+    def __init__(self, config: HierarchicalDistilBertConfig):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.temperature = config.temperature
         self.config = config
 
-        self.bert = BertModel(config, add_pooling_layer=False)
+        self.bert = DistilBertModel(config, add_pooling_layer=False)
         self.layer_weights = LayerGatingNetwork(in_features=config.num_hidden_layers)
 
         self.init_weights()
@@ -208,14 +208,14 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
         return indices_and_importances
 
 
-class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, ABC):
-    def __init__(self, config: HierarchicalBertConfig):
+class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalEmbedding, ABC):
+    def __init__(self, config: HierarchicalDistilBertConfig):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.label_smoothing = config.label_smoothing
         self.config = config
 
-        self.classifier = BertHierarchicalClassificationHead(config)
+        self.classifier = DistilBertHierarchicalClassificationHead(config)
 
         self.init_weights()
 
@@ -288,8 +288,8 @@ class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, AB
         )
 
 
-AutoConfig.register("hierarchical-bert", HierarchicalBertConfig)
+AutoConfig.register("hierarchical-distilbert", HierarchicalDistilBertConfig)
 AutoModelForSequenceClassification.register(
-    HierarchicalBertConfig,
-    BertForHierarchicalSequenceClassification
+    HierarchicalDistilBertConfig,
+    DistilBertForHierarchicalSequenceClassification
 )
