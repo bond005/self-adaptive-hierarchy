@@ -2,30 +2,30 @@ from abc import ABC
 from typing import List, Optional, Tuple, Union
 
 import torch
-from transformers import BertPreTrainedModel, BertModel, BertConfig
+from transformers import DistilBertPreTrainedModel, DistilBertModel, DistilBertConfig
 from transformers import AutoModelForSequenceClassification, AutoConfig
 from transformers.modeling_outputs import SequenceClassifierOutput
 
 from neural_network.utils import DistanceBasedLogisticLoss, LayerGatingNetwork
 
 
-class HierarchicalBertConfig(BertConfig):
-    model_type = "hierarchical-bert"
+class HierarchicalDistilBertConfig(DistilBertConfig):
+    model_type = "hierarchical-distilbert"
 
     def __init__(self, label_smoothing: Optional[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.label_smoothing = label_smoothing
 
 
-class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
-    config_class = HierarchicalBertConfig
+class DistilBertForHierarchicalEmbedding(DistilBertPreTrainedModel, ABC):
+    config_class = HierarchicalDistilBertConfig
 
-    def __init__(self, config: HierarchicalBertConfig):
+    def __init__(self, config: HierarchicalDistilBertConfig):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.config = config
 
-        self.bert = BertModel(config)
+        self.distilbert = DistilBertModel(config)
         self.layer_weights = LayerGatingNetwork(in_features=config.num_hidden_layers)
 
         self.post_init()
@@ -36,8 +36,6 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
             attention_mask: Optional[torch.FloatTensor] = None,
             input_ids_2: Optional[torch.LongTensor] = None,
             attention_mask_2: Optional[torch.LongTensor] = None,
-            token_type_ids: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.Tensor] = None,
             head_mask: Optional[torch.FloatTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
@@ -46,11 +44,9 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
     ) -> Union[Tuple, SequenceClassifierOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.bert(
+        outputs = self.distilbert(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
@@ -58,7 +54,7 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
             return_dict=False
         )
         cls_hidden_states = torch.stack(
-            tensors=outputs[2][-self.config.num_hidden_layers:],
+            tensors=outputs[1][-self.config.num_hidden_layers:],
             dim=1
         )[:, :, 0, :]
         cls_emb = self.layer_weights(cls_hidden_states.permute(0, 2, 1))[:, :, 0]
@@ -70,14 +66,14 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
             if (input_ids_2 is None) or (attention_mask_2 is None):
                 err_msg = 'The second texts (their input IDs and attention masks) in the pairs are not specified!'
                 raise ValueError(err_msg)
-            outputs_2 = self.bert(
+            outputs_2 = self.distilbert(
                 input_ids_2,
                 attention_mask=attention_mask_2,
                 output_hidden_states=True,
                 return_dict=False
             )
             cls_hidden_states_2 = torch.stack(
-                tensors=outputs_2[2][-self.config.num_hidden_layers:],
+                tensors=outputs_2[1][-self.config.num_hidden_layers:],
                 dim=1
             )[:, :, 0, :]
             cls_emb_2 = self.layer_weights(cls_hidden_states_2.permute(0, 2, 1))[:, :, 0]
@@ -109,18 +105,16 @@ class BertForHierarchicalEmbedding(BertPreTrainedModel, ABC):
         return indices_and_importances
 
 
-class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, ABC):
-    def __init__(self, config: HierarchicalBertConfig):
+class DistilBertForHierarchicalSequenceClassification(DistilBertForHierarchicalEmbedding, ABC):
+    def __init__(self, config: HierarchicalDistilBertConfig):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.label_smoothing = config.label_smoothing
         self.config = config
 
-        classifier_dropout = (
-            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
-        )
-        self.dropout = torch.nn.Dropout(classifier_dropout)
-        self.classifier = torch.nn.Linear(config.hidden_size, config.num_labels)
+        self.pre_classifier = torch.nn.Linear(config.dim, config.dim)
+        self.classifier = torch.nn.Linear(config.dim, config.num_labels)
+        self.dropout = torch.nn.Dropout(config.seq_classif_dropout)
 
         self.post_init()
 
@@ -130,8 +124,6 @@ class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, AB
             attention_mask: Optional[torch.FloatTensor] = None,
             right_input_ids: Optional[torch.LongTensor] = None,
             right_attention_mask: Optional[torch.LongTensor] = None,
-            token_type_ids: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.Tensor] = None,
             head_mask: Optional[torch.FloatTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
@@ -143,17 +135,16 @@ class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, AB
         outputs = super().forward(
             input_ids,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             return_dict=return_dict,
         )
         if return_dict:
-            pooled_output = outputs.logits
+            pooled_output = self.pre_classifier(outputs.logits)
         else:
-            pooled_output = outputs[0]
+            pooled_output = self.pre_classifier(outputs[0])
+        pooled_output = torch.nn.ReLU()(pooled_output)
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
@@ -195,8 +186,8 @@ class BertForHierarchicalSequenceClassification(BertForHierarchicalEmbedding, AB
         )
 
 
-AutoConfig.register("hierarchical-bert", HierarchicalBertConfig)
+AutoConfig.register("hierarchical-distilbert", HierarchicalDistilBertConfig)
 AutoModelForSequenceClassification.register(
-    HierarchicalBertConfig,
-    BertForHierarchicalSequenceClassification
+    HierarchicalDistilBertConfig,
+    DistilBertForHierarchicalSequenceClassification
 )

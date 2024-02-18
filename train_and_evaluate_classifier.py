@@ -1,17 +1,22 @@
 from argparse import ArgumentParser
+import gc
 import os
 import random
-from typing import Dict
+from typing import Dict, Optional, Set, Union
 import warnings
 
 from datasets import load_dataset
+from datasets import Dataset
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import torch
 from transformers import DistilBertForSequenceClassification, DistilBertTokenizer
+from transformers import BertForSequenceClassification, BertTokenizer
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, DataCollatorWithPadding
 
-from neural_network.hierarchical_bert import DistilBertForHierarchicalSequenceClassification
+from neural_network.hierarchical_distilbert import DistilBertForHierarchicalSequenceClassification
+from neural_network.hierarchical_bert import BertForHierarchicalSequenceClassification
+from neural_network.utils import HierarchyPrinterCallback
 
 
 RANDOM_SEED: int = 42
@@ -21,7 +26,7 @@ ID_TO_LABEL: Dict[str, Dict[int, str]] = {
     'mnli': {0: 'entailment', 1: 'neutral', 2: 'contradiction'},
     'mrpc': {0: 'not_equivalent', 1: 'equivalent'}
 }
-tokenizer: DistilBertTokenizer
+tokenizer: Union[DistilBertTokenizer, BertTokenizer]
 number_of_classes: int
 
 
@@ -72,6 +77,121 @@ def compute_metrics(eval_pred):
     return res
 
 
+def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
+          training_set: Dataset, validation_set: Dataset, test_set: Dataset,
+          input_model_name: str, output_model_name: str, use_hierarchy: bool, freeze_transformer: bool,
+          max_epochs: int, patience: int, minibatch: int, learning_rate: float, random_seed: int,
+          step_size: Optional[int] = None):
+    if model_type not in {'bert', 'distilbert'}:
+        raise ValueError(f'The model type {model_type} is not support!')
+    print('')
+    id2label = ID_TO_LABEL[task_name]
+    label2id = dict([(ID_TO_LABEL[task_name][label_id], label_id) for label_id in set_of_class_labels])
+    if use_hierarchy:
+        if model_type == 'distilbert':
+            model = DistilBertForHierarchicalSequenceClassification.from_pretrained(
+                input_model_name,
+                num_labels=number_of_classes, id2label=id2label, label2id=label2id
+            ).cuda()
+            print('The DistilBERT architecture is used.')
+        else:
+            model = BertForHierarchicalSequenceClassification.from_pretrained(
+                input_model_name,
+                num_labels=number_of_classes, id2label=id2label, label2id=label2id
+            ).cuda()
+            print('The BERT architecture is used.')
+        print(f'Initial layer importances are: {model.layer_importances}.')
+    else:
+        if model_type == 'distilbert':
+            model = DistilBertForSequenceClassification.from_pretrained(
+                input_model_name,
+                num_labels=number_of_classes, id2label=id2label, label2id=label2id
+            ).cuda()
+            print('The DistilBERT architecture is used.')
+        else:
+            model = BertForSequenceClassification.from_pretrained(
+                input_model_name,
+                num_labels=number_of_classes, id2label=id2label, label2id=label2id
+            ).cuda()
+            print('The BERT architecture is used.')
+    model.eval()
+    if freeze_transformer:
+        if model_type == 'distilbert':
+            for param in model.distilbert.parameters():
+                param.requires_grad = False
+        else:
+            for param in model.bert.parameters():
+                param.requires_grad = False
+        print(f'The model with frozen base (transformer) is loaded from the {input_model_name}.')
+    else:
+        print(f'The model is loaded from the {input_model_name}.')
+
+    if step_size is None:
+        iters_per_epoch = 1
+        strategy = 'epoch'
+    else:
+        iters_per_epoch = max(step_size // minibatch, 3)
+        strategy = 'steps'
+        print(f'Iterations per epoch is {iters_per_epoch}.')
+    print('')
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    training_args = TrainingArguments(
+        output_dir=output_model_name,
+        overwrite_output_dir=True,
+        learning_rate=learning_rate,
+        per_device_train_batch_size=minibatch,
+        per_device_eval_batch_size=minibatch,
+        num_train_epochs=max_epochs,
+        evaluation_strategy=strategy,
+        eval_steps=iters_per_epoch,
+        save_strategy=strategy,
+        save_steps=iters_per_epoch,
+        save_total_limit=2,
+        save_safetensors=False,
+        logging_strategy=strategy,
+        logging_steps=iters_per_epoch,
+        load_best_model_at_end=True,
+        metric_for_best_model='eval_loss',
+        greater_is_better=False,
+        gradient_checkpointing=False,
+        seed=random_seed,
+        data_seed=random_seed
+    )
+    callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
+    if use_hierarchy:
+        callbacks.append(HierarchyPrinterCallback(num_layers=5))
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=training_set,
+        eval_dataset=validation_set,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=callbacks
+    )
+    trainer.train()
+    model.save_pretrained(output_model_name, safe_serialization=False)
+    model.save_pretrained(output_model_name, safe_serialization=True)
+
+    predictions, label_ids, metrics = trainer.predict(test_set)
+    metric_name_width = max([len(metric_name) for metric_name in metrics])
+    print('')
+    if freeze_transformer:
+        print('Test results (with frozen base):')
+    else:
+        print('Test results:')
+    for metric_name in metrics:
+        print('  - {0:<{1}} = {2:.6f}'.format(metric_name, metric_name_width, metrics[metric_name]))
+    print('')
+    target_names = [id2label[label_id] for label_id in sorted(list(id2label.keys()))]
+    if isinstance(predictions, np.ndarray):
+        y_pred = np.argmax(predictions, axis=-1)
+    else:
+        y_pred = np.argmax(predictions[0], axis=-1)
+    print(classification_report(y_true=label_ids, y_pred=y_pred, target_names=target_names, digits=4))
+    print('')
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument('-i', '--input', dest='input_model_name', type=str, required=False,
@@ -80,6 +200,8 @@ def main():
                         default=BERT_NAME, help='The output BERT name after its fine-tuning.')
     parser.add_argument('-t', '--task', dest='task_name', type=str, required=True,
                         choices=['sst2', 'mnli', 'mrpc'], help='The solved task in the GLUE benchmark.')
+    parser.add_argument('-m', '--model', dest='model_type', type=str, required=True,
+                        choices=['bert', 'distilbert'], help='The model type (BERT or DistilBERT).')
     parser.add_argument('-d', '--dataset', dest='dataset_name', type=str, required=False, default='glue',
                         help='The path to the GLUE benchmark.')
     parser.add_argument('-r', '--random', dest='random_seed', type=int, required=False, default=42,
@@ -137,7 +259,10 @@ def main():
     print(f'Number of test samples is {len(test_set)}.')
 
     global tokenizer
-    tokenizer = DistilBertTokenizer.from_pretrained(args.input_model_name)
+    if args.model_type == 'distilbert':
+        tokenizer = DistilBertTokenizer.from_pretrained(args.input_model_name)
+    else:
+        tokenizer = BertTokenizer.from_pretrained(args.input_model_name)
     print(f'The BERT tokenizer is loaded from "{args.input_model_name}".')
 
     removed_columns = list(set(training_set.column_names) - {'label', 'input_ids'})
@@ -188,76 +313,31 @@ def main():
     print(f'The number of classes is {number_of_classes}.')
     print(f'They are: {[ID_TO_LABEL[args.task_name][label_id] for label_id in sorted(list(set_of_class_labels))]}')
 
-    id2label = ID_TO_LABEL[args.task_name]
-    label2id = dict([(ID_TO_LABEL[args.task_name][label_id], label_id) for label_id in set_of_class_labels])
-    if args.use_hierarchy:
-        model = DistilBertForHierarchicalSequenceClassification.from_pretrained(
-            args.input_model_name,
-            num_labels=number_of_classes, id2label=id2label, label2id=label2id
-        ).cuda()
-    else:
-        model = DistilBertForSequenceClassification.from_pretrained(
-            args.input_model_name,
-            num_labels=number_of_classes, id2label=id2label, label2id=label2id
-        ).cuda()
-    model.eval()
-    print(f'The model is loaded from the {args.input_model_name}.')
-
-    if args.step_size is None:
-        iters_per_epoch = 1
-        strategy = 'epoch'
-    else:
-        iters_per_epoch = max(args.step_size // args.minibatch, 3)
-        strategy = 'steps'
-        print(f'Iterations per epoch is {iters_per_epoch}.')
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    training_args = TrainingArguments(
-        output_dir=output_model_name,
-        overwrite_output_dir=True,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.minibatch,
-        per_device_eval_batch_size=args.minibatch,
-        num_train_epochs=args.epochs_number,
-        evaluation_strategy=strategy,
-        eval_steps=iters_per_epoch,
-        save_strategy=strategy,
-        save_steps=iters_per_epoch,
-        save_total_limit=2,
-        save_safetensors=False,
-        logging_strategy=strategy,
-        logging_steps=iters_per_epoch,
-        load_best_model_at_end=True,
-        metric_for_best_model='eval_f1',
-        greater_is_better=True,
-        gradient_checkpointing=False,
-        seed=args.random_seed,
-        data_seed=args.random_seed
-    )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=training_set,
-        eval_dataset=validation_set,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)]
-    )
-    trainer.train()
-    model.save_pretrained(output_model_name, safe_serialization=False)
-    model.save_pretrained(output_model_name, safe_serialization=True)
-
-    predictions, label_ids, metrics = trainer.predict(test_set)
-    metric_name_width = max([len(metric_name) for metric_name in metrics])
-    print('Test results:')
-    for metric_name in metrics:
-        print('  - {0:<{1}} = {2:.6f}'.format(metric_name, metric_name_width, metrics[metric_name]))
     print('')
-    target_names = [id2label[label_id] for label_id in sorted(list(id2label.keys()))]
-    if isinstance(predictions, np.ndarray):
-        y_pred = np.argmax(predictions, axis=-1)
-    else:
-        y_pred = np.argmax(predictions[0], axis=-1)
-    print(classification_report(y_true=label_ids, y_pred=y_pred, target_names=target_names, digits=4))
+    print('Three random samples from the training data are:')
+    print('')
+    for sample_idx in random.sample(list(range(len(training_set))), k=3):
+        input_ids = training_set['input_ids'][sample_idx]
+        print(input_ids)
+        print(tokenizer.decode(input_ids, skip_special_tokens=False))
+        print('')
+
+    train(task_name=args.task_name, set_of_class_labels=set_of_class_labels,
+          training_set=training_set, validation_set=validation_set, test_set=test_set,
+          input_model_name=args.input_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
+          use_hierarchy=args.use_hierarchy, freeze_transformer=True,
+          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience, minibatch=args.minibatch,
+          learning_rate=args.learning_rate, random_seed=args.random_seed)
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    train(task_name=args.task_name, set_of_class_labels=set_of_class_labels,
+          training_set=training_set, validation_set=validation_set, test_set=test_set,
+          input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
+          use_hierarchy=args.use_hierarchy, freeze_transformer=False,
+          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience, minibatch=args.minibatch,
+          learning_rate=args.learning_rate, random_seed=args.random_seed)
 
 
 if __name__ == '__main__':
