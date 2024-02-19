@@ -2,7 +2,7 @@ from argparse import ArgumentParser
 import gc
 import os
 import random
-from typing import Dict, Optional, Set, Union
+from typing import Dict, Set, Union
 import warnings
 
 from datasets import load_dataset
@@ -10,6 +10,7 @@ from datasets import Dataset
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import torch
+from transformers import get_cosine_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
 from transformers import DistilBertForSequenceClassification, DistilBertTokenizer
 from transformers import BertForSequenceClassification, BertTokenizer
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, DataCollatorWithPadding
@@ -80,8 +81,8 @@ def compute_metrics(eval_pred):
 def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
           training_set: Dataset, validation_set: Dataset, test_set: Dataset,
           input_model_name: str, output_model_name: str, use_hierarchy: bool, freeze_transformer: bool,
-          max_epochs: int, patience: int, minibatch: int, learning_rate: float, random_seed: int,
-          step_size: Optional[int] = None):
+          max_epochs: int, patience: int, minibatch: int, learning_rate: float, cyclic_scheduling: bool,
+          random_seed: int):
     if model_type not in {'bert', 'distilbert'}:
         raise ValueError(f'The model type {model_type} is not support!')
     print('')
@@ -126,13 +127,6 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
     else:
         print(f'The model is loaded from the {input_model_name}.')
 
-    if step_size is None:
-        iters_per_epoch = 1
-        strategy = 'epoch'
-    else:
-        iters_per_epoch = max(step_size // minibatch, 3)
-        strategy = 'steps'
-        print(f'Iterations per epoch is {iters_per_epoch}.')
     print('')
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     training_args = TrainingArguments(
@@ -142,14 +136,11 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         per_device_train_batch_size=minibatch,
         per_device_eval_batch_size=minibatch,
         num_train_epochs=max_epochs,
-        evaluation_strategy=strategy,
-        eval_steps=iters_per_epoch,
-        save_strategy=strategy,
-        save_steps=iters_per_epoch,
+        evaluation_strategy='epoch',
+        save_strategy='epoch',
         save_total_limit=2,
         save_safetensors=False,
-        logging_strategy=strategy,
-        logging_steps=iters_per_epoch,
+        logging_strategy='epoch',
         load_best_model_at_end=True,
         metric_for_best_model='eval_loss',
         greater_is_better=False,
@@ -160,9 +151,35 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
     callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
     if use_hierarchy:
         callbacks.append(HierarchyPrinterCallback(num_layers=5))
+    steps_per_epoch = max(1, len(training_set) // minibatch)
+    print(f'Number of steps per epoch is {steps_per_epoch}.')
+    num_training_steps = steps_per_epoch * max_epochs
+    print(f'Total number of training steps is {num_training_steps}.')
+    if cyclic_scheduling:
+        num_warmup_steps = min(steps_per_epoch * max(round(0.1 * max_epochs), 2), steps_per_epoch * (2 * patience) // 3)
+        print(f'Number of warmup steps is {num_warmup_steps}.')
+    else:
+        num_warmup_steps = 0
+    optim = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+    if cyclic_scheduling:
+        num_cycles = max(1, max_epochs // patience)
+        scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+            optimizer=optim,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=max(1, max_epochs // patience)
+        )
+        print(f'Number of cycles is {num_cycles}.')
+    else:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer=optim,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
     trainer = Trainer(
         model=model,
         args=training_args,
+        optimizers=(optim, scheduler),
         train_dataset=training_set,
         eval_dataset=validation_set,
         data_collator=data_collator,
@@ -212,12 +229,12 @@ def main():
                         help='The minibatch size.')
     parser.add_argument('--epochs', dest='epochs_number', type=int, required=False, default=100,
                         help='The maximal number of epochs.')
-    parser.add_argument('--lr', dest='learning_rate', type=float, required=False, default=1e-5,
-                        help='The learning rate.')
+    parser.add_argument('--lr1', dest='learning_rate_1', type=float, required=False, default=1e-3,
+                        help='The learning rate on the first phase (fine-tuning with frozen Transformer).')
+    parser.add_argument('--lr2', dest='learning_rate_2', type=float, required=False, default=1e-6,
+                        help='The learning rate on the second phase (fine-tuning with unfrozen Transformer).')
     parser.add_argument('--patience', dest='patience', type=int, required=False, default=3,
                         help='The patience for the early stopping.')
-    parser.add_argument('--stepsize', dest='step_size', type=int, required=False, default=None,
-                        help='The step size, i.e. samples per epoch.')
     args = parser.parse_args()
 
     n_processes = max(1, os.cpu_count())
@@ -326,8 +343,8 @@ def main():
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.input_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=True,
-          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience, minibatch=args.minibatch,
-          learning_rate=args.learning_rate, random_seed=args.random_seed)
+          max_epochs=args.epochs_number, cyclic_scheduling=False, patience=args.patience, minibatch=args.minibatch,
+          learning_rate=args.learning_rate_1, random_seed=args.random_seed)
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -336,8 +353,8 @@ def main():
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=False,
-          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience,
-          minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate / 10.0, random_seed=args.random_seed)
+          max_epochs=args.epochs_number, cyclic_scheduling=True, patience=args.patience,
+          minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate_2, random_seed=args.random_seed)
 
 
 if __name__ == '__main__':
