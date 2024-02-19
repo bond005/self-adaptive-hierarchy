@@ -336,8 +336,8 @@ def main():
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=False,
-          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience, minibatch=args.minibatch,
-          learning_rate=args.learning_rate, random_seed=args.random_seed)
+          max_epochs=args.epochs_number, step_size=args.step_size, patience=args.patience,
+          minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate / 10.0, random_seed=args.random_seed)
 
 
 if __name__ == '__main__':
