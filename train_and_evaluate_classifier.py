@@ -10,7 +10,7 @@ from datasets import Dataset
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 import torch
-from transformers import get_cosine_schedule_with_warmup, get_cosine_with_hard_restarts_schedule_with_warmup
+from transformers import get_constant_schedule_with_warmup, get_constant_schedule
 from transformers import DistilBertForSequenceClassification, DistilBertTokenizer
 from transformers import BertForSequenceClassification, BertTokenizer
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback, DataCollatorWithPadding
@@ -80,8 +80,9 @@ def compute_metrics(eval_pred):
 
 def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
           training_set: Dataset, validation_set: Dataset, test_set: Dataset,
-          input_model_name: str, output_model_name: str, use_hierarchy: bool, freeze_transformer: bool,
-          max_epochs: int, patience: int, minibatch: int, learning_rate: float, cyclic_scheduling: bool,
+          input_model_name: str, output_model_name: str, metric_name: str,
+          use_hierarchy: bool, freeze_hierarchy: bool, freeze_transformer: bool,
+          max_epochs: int, patience: int, minibatch: int, learning_rate: float, warmup: bool,
           random_seed: int):
     if model_type not in {'bert', 'distilbert'}:
         raise ValueError(f'The model type {model_type} is not support!')
@@ -102,6 +103,9 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
             ).cuda()
             print('The BERT architecture is used.')
         print(f'Initial layer importances are: {model.layer_importances}.')
+        if freeze_hierarchy:
+            for param in model.layer_weights.parameters():
+                param.requires_grad = False
     else:
         if model_type == 'distilbert':
             model = DistilBertForSequenceClassification.from_pretrained(
@@ -142,8 +146,8 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         save_safetensors=False,
         logging_strategy='epoch',
         load_best_model_at_end=True,
-        metric_for_best_model='eval_loss',
-        greater_is_better=False,
+        metric_for_best_model=f'eval_{metric_name}',
+        greater_is_better=(metric_name != 'loss'),
         gradient_checkpointing=False,
         seed=random_seed,
         data_seed=random_seed
@@ -155,27 +159,16 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
     print(f'Number of steps per epoch is {steps_per_epoch}.')
     num_training_steps = steps_per_epoch * max_epochs
     print(f'Total number of training steps is {num_training_steps}.')
-    if cyclic_scheduling:
+    if warmup:
         num_warmup_steps = min(steps_per_epoch * max(round(0.1 * max_epochs), 2), steps_per_epoch * (2 * patience) // 3)
         print(f'Number of warmup steps is {num_warmup_steps}.')
     else:
         num_warmup_steps = 0
     optim = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
-    if cyclic_scheduling:
-        num_cycles = max(1, max_epochs // patience)
-        scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-            optimizer=optim,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            num_cycles=max(1, max_epochs // patience)
-        )
-        print(f'Number of cycles is {num_cycles}.')
+    if warmup:
+        scheduler = get_constant_schedule_with_warmup(optimizer=optim, num_warmup_steps=num_warmup_steps)
     else:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optim,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
+        scheduler = get_constant_schedule(optimizer=optim)
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -235,6 +228,8 @@ def main():
                         help='The learning rate on the second phase (fine-tuning with unfrozen Transformer).')
     parser.add_argument('--patience', dest='patience', type=int, required=False, default=3,
                         help='The patience for the early stopping.')
+    parser.add_argument('--metric', dest='metric_name', type=str, required=True,
+                        choices=['loss', 'accuracy', 'f1'], help='The monitored metric for early stopping.')
     args = parser.parse_args()
 
     n_processes = max(1, os.cpu_count())
@@ -342,9 +337,9 @@ def main():
     train(task_name=args.task_name, set_of_class_labels=set_of_class_labels,
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.input_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
-          use_hierarchy=args.use_hierarchy, freeze_transformer=True,
-          max_epochs=args.epochs_number, cyclic_scheduling=False, patience=args.patience, minibatch=args.minibatch,
-          learning_rate=args.learning_rate_1, random_seed=args.random_seed)
+          use_hierarchy=args.use_hierarchy, freeze_transformer=True, freeze_hierarchy=False,
+          max_epochs=args.epochs_number, warmup=False, patience=args.patience, minibatch=args.minibatch,
+          learning_rate=args.learning_rate_1, random_seed=args.random_seed, metric_name=args.metric_name)
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -352,8 +347,8 @@ def main():
     train(task_name=args.task_name, set_of_class_labels=set_of_class_labels,
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
-          use_hierarchy=args.use_hierarchy, freeze_transformer=False,
-          max_epochs=args.epochs_number, cyclic_scheduling=True, patience=args.patience,
+          use_hierarchy=args.use_hierarchy, freeze_transformer=False, freeze_hierarchy=True,
+          max_epochs=args.epochs_number, warmup=True, patience=args.patience, metric_name=args.metric_name,
           minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate_2, random_seed=args.random_seed)
 
 
