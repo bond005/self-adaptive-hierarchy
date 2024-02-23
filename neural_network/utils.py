@@ -36,9 +36,10 @@ class LayerGatingNetwork(torch.nn.Module):
 
     def reset_parameters(self) -> None:
         initial_layer_weights = np.array(
-            [1.0 / self.in_features for _ in range(self.in_features)],
+            [1.0 / (self.in_features - layer_idx) for layer_idx in range(self.in_features)],
             dtype=np.float32
         )
+        initial_layer_weights /= np.sum(initial_layer_weights)
         initial_layer_weights_pt = torch.tensor(
             initial_layer_weights.reshape((1, self.in_features)),
             dtype=self.weight.dtype,

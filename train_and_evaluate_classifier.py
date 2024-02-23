@@ -1,4 +1,5 @@
 from argparse import ArgumentParser
+import re
 import gc
 import os
 import random
@@ -27,34 +28,72 @@ ID_TO_LABEL: Dict[str, Dict[int, str]] = {
     'mnli': {0: 'entailment', 1: 'neutral', 2: 'contradiction'},
     'mrpc': {0: 'not_equivalent', 1: 'equivalent'}
 }
+input_prompt: Union[str, None] = None
 tokenizer: Union[DistilBertTokenizer, BertTokenizer]
 number_of_classes: int
 
 
+def check_prompt(prompt: str) -> int:
+    re_for_check = re.compile(r'{\d+}')
+    found_idx = prompt.find('{0}')
+    if found_idx < 0:
+        if re_for_check.search(prompt) is not None:
+            raise ValueError(f'The prompt "{prompt}" is incorrect!')
+        n_fields = 0
+    else:
+        found_idx_ = prompt[(found_idx + 3):].find('{1}')
+        if found_idx_ < 0:
+            if re_for_check.search(prompt[(found_idx + 3):]) is not None:
+                raise ValueError(f'The prompt "{prompt}" is incorrect!')
+            n_fields = 1
+        else:
+            found_idx += (found_idx_ + 3)
+            if re_for_check.search(prompt[(found_idx + 3):]) is not None:
+                raise ValueError(f'The prompt "{prompt}" is incorrect!')
+            n_fields = 2
+    return n_fields
+
+
 def mnli_to_array_fn(batch):
-    premise = batch['premise']
-    hypothesis = batch['hypothesis']
-    input_ids = tokenizer.encode(
-        tokenizer.cls_token + premise + tokenizer.sep_token + hypothesis + tokenizer.sep_token,
-        add_special_tokens=False
-    )
+    premise = batch['premise'].strip()
+    hypothesis = batch['hypothesis'].strip()
+    if input_prompt is None:
+        input_ids = tokenizer.encode(
+            tokenizer.cls_token + premise + tokenizer.sep_token + hypothesis + tokenizer.sep_token,
+            add_special_tokens=False
+        )
+    else:
+        united_sentence = input_prompt.format(premise, hypothesis)
+        input_ids = tokenizer.encode(
+            united_sentence,
+            add_special_tokens=True
+        )
     batch['input_ids'] = input_ids
     return batch
 
 
 def mrpc_to_array_fn(batch):
-    sentence1 = batch['sentence1']
-    sentence2 = batch['sentence2']
-    input_ids = tokenizer.encode(
-        tokenizer.cls_token + sentence1 + tokenizer.sep_token + sentence2 + tokenizer.sep_token,
-        add_special_tokens=False
-    )
+    sentence1 = batch['sentence1'].strip()
+    sentence2 = batch['sentence2'].strip()
+    if input_prompt is None:
+        input_ids = tokenizer.encode(
+            tokenizer.cls_token + sentence1 + tokenizer.sep_token + sentence2 + tokenizer.sep_token,
+            add_special_tokens=False
+        )
+    else:
+        united_sentence = input_prompt.format(sentence1, sentence2)
+        input_ids = tokenizer.encode(
+            united_sentence,
+            add_special_tokens=True
+        )
     batch['input_ids'] = input_ids
     return batch
 
 
 def sst2_to_array_fn(batch):
-    sentence = batch['sentence']
+    sentence = batch['sentence'].strip()
+    if input_prompt is not None:
+        sentence = input_prompt.format(sentence)
     input_ids = tokenizer.encode(
         sentence,
         add_special_tokens=True
@@ -82,7 +121,7 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
           training_set: Dataset, validation_set: Dataset, test_set: Dataset,
           input_model_name: str, output_model_name: str, metric_name: str,
           use_hierarchy: bool, freeze_hierarchy: bool, freeze_transformer: bool,
-          max_epochs: int, patience: int, minibatch: int, learning_rate: float, warmup: bool,
+          max_epochs: int, patience: int, minibatch: int, learning_rate: float, warmup: int,
           random_seed: int):
     if model_type not in {'bert', 'distilbert'}:
         raise ValueError(f'The model type {model_type} is not support!')
@@ -159,13 +198,13 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
     print(f'Number of steps per epoch is {steps_per_epoch}.')
     num_training_steps = steps_per_epoch * max_epochs
     print(f'Total number of training steps is {num_training_steps}.')
-    if warmup:
-        num_warmup_steps = min(steps_per_epoch * max(round(0.1 * max_epochs), 2), steps_per_epoch * (2 * patience) // 3)
+    if warmup > 0:
+        num_warmup_steps = steps_per_epoch * warmup
         print(f'Number of warmup steps is {num_warmup_steps}.')
     else:
         num_warmup_steps = 0
     optim = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
-    if warmup:
+    if warmup > 0:
         scheduler = get_constant_schedule_with_warmup(optimizer=optim, num_warmup_steps=num_warmup_steps)
     else:
         scheduler = get_constant_schedule(optimizer=optim)
@@ -228,8 +267,12 @@ def main():
                         help='The learning rate on the second phase (fine-tuning with unfrozen Transformer).')
     parser.add_argument('--patience', dest='patience', type=int, required=False, default=3,
                         help='The patience for the early stopping.')
+    parser.add_argument('--warmup', dest='warmup', type=int, required=False, default=3,
+                        help='The number of warmup steps to do.')
     parser.add_argument('--metric', dest='metric_name', type=str, required=True,
                         choices=['loss', 'accuracy', 'f1'], help='The monitored metric for early stopping.')
+    parser.add_argument('--prompt', dest='prompt', type=str, required=False, default=None,
+                        help='The additional input prompt.')
     args = parser.parse_args()
 
     n_processes = max(1, os.cpu_count())
@@ -241,6 +284,24 @@ def main():
         raise ValueError('CUDA is not available!')
     torch.manual_seed(args.random_seed)
     torch.cuda.manual_seed(args.random_seed)
+
+    global input_prompt
+    if args.prompt is None:
+        input_prompt = None
+    else:
+        input_prompt = args.prompt.strip()
+        if len(input_prompt) > 0:
+            input_prompt = ' '.join(input_prompt.split())
+            number_of_fields = check_prompt(input_prompt)
+            if number_of_fields > 0:
+                if args.task_name == 'sst2':
+                    if number_of_fields != 1:
+                        raise ValueError(f'The prompt "{input_prompt}" is incorrect!')
+                else:
+                    if number_of_fields != 2:
+                        raise ValueError(f'The prompt "{input_prompt}" is incorrect!')
+        else:
+            input_prompt = None
 
     output_model_name = os.path.normpath(args.output_model_name)
     if len(output_model_name) == 0:
@@ -256,7 +317,8 @@ def main():
                                num_proc=n_processes)
     else:
         dataset = load_dataset(args.dataset_name, args.task_name, split='train', num_proc=n_processes)
-    train_test_split = dataset.train_test_split(shuffle=True, test_size=0.1, seed=args.random_seed)
+    train_test_split = dataset.train_test_split(shuffle=True, test_size=0.3, seed=args.random_seed,
+                                                stratify_by_column='label')
     training_set = train_test_split['train']
     validation_set = train_test_split['test']
     del dataset, train_test_split
@@ -338,7 +400,7 @@ def main():
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.input_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=True, freeze_hierarchy=False,
-          max_epochs=args.epochs_number, warmup=False, patience=args.patience, minibatch=args.minibatch,
+          max_epochs=args.epochs_number, warmup=0, patience=args.patience, minibatch=args.minibatch,
           learning_rate=args.learning_rate_1, random_seed=args.random_seed, metric_name=args.metric_name)
 
     torch.cuda.empty_cache()
@@ -348,7 +410,7 @@ def main():
           training_set=training_set, validation_set=validation_set, test_set=test_set,
           input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=False, freeze_hierarchy=True,
-          max_epochs=args.epochs_number, warmup=True, patience=args.patience, metric_name=args.metric_name,
+          max_epochs=args.epochs_number, warmup=args.warmup, patience=args.patience, metric_name=args.metric_name,
           minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate_2, random_seed=args.random_seed)
 
 
