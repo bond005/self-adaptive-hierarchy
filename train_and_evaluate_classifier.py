@@ -206,7 +206,7 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         print(f'Number of warmup steps is {num_warmup_steps}.')
     else:
         num_warmup_steps = 0
-    optim = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+    optim = torch.optim.SGD(params=model.parameters(), lr=learning_rate, nesterov=True, momentum=0.9)
     if warmup > 0:
         scheduler = get_constant_schedule_with_warmup(optimizer=optim, num_warmup_steps=num_warmup_steps)
     else:
