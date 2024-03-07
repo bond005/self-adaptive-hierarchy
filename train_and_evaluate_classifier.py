@@ -121,7 +121,7 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
           training_set: Dataset, validation_set: Dataset, test_set: Dataset,
           input_model_name: str, output_model_name: str, metric_name: str,
           use_hierarchy: bool, freeze_hierarchy: bool, freeze_transformer: bool,
-          max_epochs: int, patience: int, minibatch: int, learning_rate: float, warmup: int,
+          max_epochs: int, patience: Union[int, None], minibatch: int, learning_rate: float, warmup: int,
           random_seed: int):
     if model_type not in {'bert', 'distilbert'}:
         raise ValueError(f'The model type {model_type} is not support!')
@@ -191,7 +191,10 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         seed=random_seed,
         data_seed=random_seed
     )
-    callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
+    if patience is None:
+        callbacks = []
+    else:
+        callbacks = [EarlyStoppingCallback(early_stopping_patience=patience)]
     if use_hierarchy:
         callbacks.append(HierarchyPrinterCallback(num_layers=5))
     steps_per_epoch = max(1, len(training_set) // minibatch)
@@ -208,16 +211,27 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         scheduler = get_constant_schedule_with_warmup(optimizer=optim, num_warmup_steps=num_warmup_steps)
     else:
         scheduler = get_constant_schedule(optimizer=optim)
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        optimizers=(optim, scheduler),
-        train_dataset=training_set,
-        eval_dataset=validation_set,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        callbacks=callbacks
-    )
+    if len(callbacks) > 0:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            optimizers=(optim, scheduler),
+            train_dataset=training_set,
+            eval_dataset=validation_set,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            callbacks=callbacks
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            optimizers=(optim, scheduler),
+            train_dataset=training_set,
+            eval_dataset=validation_set,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics
+        )
     trainer.train()
     model.save_pretrained(output_model_name, safe_serialization=False)
     model.save_pretrained(output_model_name, safe_serialization=True)
@@ -265,7 +279,7 @@ def main():
                         help='The learning rate on the first phase (fine-tuning with frozen Transformer).')
     parser.add_argument('--lr2', dest='learning_rate_2', type=float, required=False, default=1e-6,
                         help='The learning rate on the second phase (fine-tuning with unfrozen Transformer).')
-    parser.add_argument('--patience', dest='patience', type=int, required=False, default=3,
+    parser.add_argument('--patience', dest='patience', type=int, required=False, default=None,
                         help='The patience for the early stopping.')
     parser.add_argument('--warmup', dest='warmup', type=int, required=False, default=3,
                         help='The number of warmup steps to do.')
