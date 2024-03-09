@@ -119,12 +119,14 @@ def compute_metrics(eval_pred):
 
 def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
           training_set: Dataset, validation_set: Dataset, test_set: Dataset,
-          input_model_name: str, output_model_name: str, metric_name: str,
+          input_model_name: str, output_model_name: str, metric_name: str, optimizer_name: str,
           use_hierarchy: bool, freeze_hierarchy: bool, freeze_transformer: bool,
           max_epochs: int, patience: Union[int, None], minibatch: int, learning_rate: float, warmup: int,
           random_seed: int):
     if model_type not in {'bert', 'distilbert'}:
         raise ValueError(f'The model type {model_type} is not support!')
+    if optimizer_name not in {'sgd', 'adam'}:
+        raise ValueError(f'The optimizer {optimizer_name} is not support!')
     print('')
     id2label = ID_TO_LABEL[task_name]
     label2id = dict([(ID_TO_LABEL[task_name][label_id], label_id) for label_id in set_of_class_labels])
@@ -206,7 +208,12 @@ def train(task_name: str, set_of_class_labels: Set[int], model_type: str,
         print(f'Number of warmup steps is {num_warmup_steps}.')
     else:
         num_warmup_steps = 0
-    optim = torch.optim.SGD(params=model.parameters(), lr=learning_rate, nesterov=True, momentum=0.9)
+    if optimizer_name == 'sgd':
+        optim = torch.optim.SGD(params=model.parameters(), lr=learning_rate)
+        print('SGD is used for optimization.')
+    else:
+        optim = torch.optim.Adam(params=model.parameters(), lr=learning_rate)
+        print('Adam is used for optimization.')
     if warmup > 0:
         scheduler = get_constant_schedule_with_warmup(optimizer=optim, num_warmup_steps=num_warmup_steps)
     else:
@@ -279,6 +286,12 @@ def main():
                         help='The learning rate on the first phase (fine-tuning with frozen Transformer).')
     parser.add_argument('--lr2', dest='learning_rate_2', type=float, required=False, default=1e-6,
                         help='The learning rate on the second phase (fine-tuning with unfrozen Transformer).')
+    parser.add_argument('--alg1', dest='algorithm_1', type=str, required=False,
+                        default='adam', choices=['adam', 'sgd'],
+                        help='The optimization algorithm on the first phase (fine-tuning with frozen Transformer).')
+    parser.add_argument('--alg2', dest='algorithm_2', type=str, required=False,
+                        default='sgd', choices=['adam', 'sgd'],
+                        help='The optimization algorithm on the second phase (fine-tuning with unfrozen Transformer).')
     parser.add_argument('--patience', dest='patience', type=int, required=False, default=None,
                         help='The patience for the early stopping.')
     parser.add_argument('--warmup', dest='warmup', type=int, required=False, default=3,
@@ -415,7 +428,8 @@ def main():
           input_model_name=args.input_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=True, freeze_hierarchy=False,
           max_epochs=args.epochs_number, warmup=0, patience=args.patience, minibatch=args.minibatch,
-          learning_rate=args.learning_rate_1, random_seed=args.random_seed, metric_name=args.metric_name)
+          optimizer_name=args.algorithm_1, learning_rate=args.learning_rate_1, metric_name=args.metric_name,
+          random_seed=args.random_seed)
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -425,7 +439,8 @@ def main():
           input_model_name=args.output_model_name, output_model_name=args.output_model_name, model_type=args.model_type,
           use_hierarchy=args.use_hierarchy, freeze_transformer=False, freeze_hierarchy=True,
           max_epochs=args.epochs_number, warmup=args.warmup, patience=args.patience, metric_name=args.metric_name,
-          minibatch=max(args.minibatch // 4, 1), learning_rate=args.learning_rate_2, random_seed=args.random_seed)
+          minibatch=max(args.minibatch // 4, 1), optimizer_name=args.algorithm_2, learning_rate=args.learning_rate_2,
+          random_seed=args.random_seed)
 
 
 if __name__ == '__main__':
